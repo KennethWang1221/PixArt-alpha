@@ -171,3 +171,4 @@ pyproject.toml
 sa_000000.tar
 sd-model-finetuned-lora/
 setup_fork.sh
+flickr30k
