@@ -166,3 +166,8 @@ docker/cache/huggingface
 # Environment files
 .envrc
 .env
+pokemon-blip-captions/
+pyproject.toml
+sa_000000.tar
+sd-model-finetuned-lora/
+setup_fork.sh

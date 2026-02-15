@@ -15,6 +15,7 @@
 """Fine-tuning script for Stable Diffusion for text2image with support for LoRA."""
 
 import argparse
+import inspect
 import logging
 import math
 import os
@@ -121,8 +122,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default="PixArt-alpha/PixArt-XL-2-1024-MS",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -141,7 +141,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default=None,
+        default="./pokemon-blip-captions",
         help=(
             "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
@@ -179,7 +179,7 @@ def parse_args():
     parser.add_argument(
         "--num_validation_images",
         type=int,
-        default=4,
+        default=0,
         help="Number of images that should be generated during validation with `validation_prompt`.",
     )
     parser.add_argument(
@@ -216,7 +216,7 @@ def parse_args():
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=256,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -237,19 +237,19 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=None,
+        default=4,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=16,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
@@ -359,13 +359,20 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="fp16",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
             " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
         ),
+    )
+    parser.add_argument(
+        "--text_encoder_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Device to place frozen T5 text encoder. Use cpu to reduce CUDA memory usage.",
     )
     parser.add_argument(
         "--report_to",
@@ -489,18 +496,27 @@ def main():
         weight_dtype = torch.bfloat16
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", torch_dtype=weight_dtype)
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler", torch_dtype=weight_dtype
+    )
     tokenizer = T5Tokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, torch_dtype=weight_dtype)
 
-    text_encoder = T5EncoderModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, torch_dtype=weight_dtype)
+    text_encoder_device = torch.device("cuda" if (args.text_encoder_device == "cuda" and torch.cuda.is_available()) else "cpu")
+    text_encoder = T5EncoderModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, torch_dtype=weight_dtype
+    )
     text_encoder.requires_grad_(False)
-    text_encoder.to(accelerator.device)
+    text_encoder.to(text_encoder_device)
 
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant, torch_dtype=weight_dtype)
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant, torch_dtype=weight_dtype
+    )
     vae.requires_grad_(False)
     vae.to(accelerator.device)
 
-    transformer = Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="transformer", torch_dtype=weight_dtype)
+    transformer = Transformer2DModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="transformer", torch_dtype=weight_dtype
+    )
 
     # freeze parameters of models to save more memory
     transformer.requires_grad_(False)    
@@ -509,7 +525,7 @@ def main():
     for param in transformer.parameters():
         param.requires_grad_(False)
 
-    lora_config = LoraConfig(
+    lora_kwargs = dict(
         r=args.rank,
         init_lora_weights="gaussian",
         target_modules=[
@@ -527,9 +543,15 @@ def main():
             "linear_2",
             # "scale_shift_table",      # not available due to the implementation in huggingface/peft, working on it.
         ],
-        use_dora = args.use_dora,
-        use_rslora = args.use_rslora
     )
+    lora_params = inspect.signature(LoraConfig.__init__).parameters
+    supports_use_dora = "use_dora" in lora_params
+    supports_use_rslora = "use_rslora" in lora_params
+    if supports_use_dora:
+        lora_kwargs["use_dora"] = args.use_dora
+    if supports_use_rslora:
+        lora_kwargs["use_rslora"] = args.use_rslora
+    lora_config = LoraConfig(**lora_kwargs)
 
     # Move transformer, vae and text_encoder to device and cast to weight_dtype
     transformer.to(accelerator.device)
@@ -831,8 +853,11 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                prompt_embeds = text_encoder(batch["input_ids"], attention_mask=batch['prompt_attention_mask'])[0]
-                prompt_attention_mask = batch['prompt_attention_mask']
+                input_ids_te = batch["input_ids"].to(text_encoder_device)
+                prompt_attention_mask = batch['prompt_attention_mask'].to(text_encoder_device)
+                prompt_embeds = text_encoder(input_ids_te, attention_mask=prompt_attention_mask)[0]
+                prompt_embeds = prompt_embeds.to(device=latents.device, dtype=weight_dtype)
+                prompt_attention_mask = prompt_attention_mask.to(device=latents.device)
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
                     # set prediction_type of scheduler if defined
@@ -938,7 +963,7 @@ def main():
                 break
 
         if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+            if args.validation_prompt is not None and args.num_validation_images > 0 and epoch % args.validation_epochs == 0:
                 logger.info(
                     f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
                     f" {args.validation_prompt}."
@@ -999,41 +1024,42 @@ def main():
             )
 
     
-    # Final inference
-    # Load previous transformer
-    transformer = Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path, subfolder='transformer', torch_dtype=weight_dtype)
-    # load lora weight
-    transformer = PeftModel.from_pretrained(transformer, args.output_dir)
-    # Load previous pipeline
-    pipeline = DiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, transformer=transformer, text_encoder=text_encoder, vae=vae, torch_dtype=weight_dtype,)
-    pipeline = pipeline.to(accelerator.device)
+    if args.num_validation_images > 0 and args.validation_prompt is not None:
+        # Final inference
+        # Load previous transformer
+        transformer = Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path, subfolder='transformer', torch_dtype=weight_dtype)
+        # load lora weight
+        transformer = PeftModel.from_pretrained(transformer, args.output_dir)
+        # Load previous pipeline
+        pipeline = DiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, transformer=transformer, text_encoder=text_encoder, vae=vae, torch_dtype=weight_dtype,)
+        pipeline = pipeline.to(accelerator.device)
 
-    del transformer
-    torch.cuda.empty_cache()
+        del transformer
+        torch.cuda.empty_cache()
 
-    # run inference
-    generator = torch.Generator(device=accelerator.device)
-    if args.seed is not None:
-        generator = generator.manual_seed(args.seed)
-    images = []
-    for _ in range(args.num_validation_images):
-        images.append(pipeline(args.validation_prompt, num_inference_steps=20, generator=generator).images[0])
+        # run inference
+        generator = torch.Generator(device=accelerator.device)
+        if args.seed is not None:
+            generator = generator.manual_seed(args.seed)
+        images = []
+        for _ in range(args.num_validation_images):
+            images.append(pipeline(args.validation_prompt, num_inference_steps=20, generator=generator).images[0])
 
-    if accelerator.is_main_process:
-        for tracker in accelerator.trackers:
-            if len(images) != 0:
-                if tracker.name == "tensorboard":
-                    np_images = np.stack([np.asarray(img) for img in images])
-                    tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
-                if tracker.name == "wandb":
-                    tracker.log(
-                        {
-                            "test": [
-                                wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                for i, image in enumerate(images)
-                            ]
-                        }
-                    )
+        if accelerator.is_main_process:
+            for tracker in accelerator.trackers:
+                if len(images) != 0:
+                    if tracker.name == "tensorboard":
+                        np_images = np.stack([np.asarray(img) for img in images])
+                        tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
+                    if tracker.name == "wandb":
+                        tracker.log(
+                            {
+                                "test": [
+                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
+                                    for i, image in enumerate(images)
+                                ]
+                            }
+                        )
 
     accelerator.end_training()
 
